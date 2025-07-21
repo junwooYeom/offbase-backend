@@ -9,9 +9,18 @@ on:
     branches:
       - develop
       - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
 
 jobs:
-  check-migrations:
+  validate:
     runs-on: ubuntu-latest
     outputs:
       has-migrations: ${{ steps.check.outputs.has-migrations }}
@@ -20,49 +29,65 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Check for migrations
+      - name: Check migrations
         id: check
         run: |
-          if [ -d "supabase/migrations" ] && [ "$(ls -A supabase/migrations)" ]; then
-            echo "has-migrations=true" >> $GITHUB_OUTPUT
-            echo "migration-count=$(ls -1 supabase/migrations/*.sql 2>/dev/null | wc -l)" >> $GITHUB_OUTPUT
-            echo "✅ Found $(ls -1 supabase/migrations/*.sql 2>/dev/null | wc -l) migration files"
-            ls -la supabase/migrations/
-          else
+          echo "🔍 Checking for migration files..."
+          
+          if [ ! -d "supabase/migrations" ]; then
+            echo "❌ No migrations directory found"
             echo "has-migrations=false" >> $GITHUB_OUTPUT
             echo "migration-count=0" >> $GITHUB_OUTPUT
-            echo "⚠️ No migration files found!"
+            exit 0
           fi
-
-  validate-migrations:
-    needs: check-migrations
-    if: needs.check-migrations.outputs.has-migrations == 'true'
-    runs-on: ubuntu-latest
-    
-    steps:
-      - uses: actions/checkout@v4
+          
+          # Count actual SQL files (ignore .gitkeep)
+          SQL_COUNT=$(find supabase/migrations -name "*.sql" -type f | wc -l)
+          
+          if [ $SQL_COUNT -gt 0 ]; then
+            echo "✅ Found $SQL_COUNT migration files"
+            echo "has-migrations=true" >> $GITHUB_OUTPUT
+            echo "migration-count=$SQL_COUNT" >> $GITHUB_OUTPUT
+            ls -la supabase/migrations/*.sql
+          else
+            echo "⚠️ No SQL migration files found"
+            echo "has-migrations=false" >> $GITHUB_OUTPUT
+            echo "migration-count=0" >> $GITHUB_OUTPUT
+          fi
       
       - name: Validate SQL syntax
+        if: steps.check.outputs.has-migrations == 'true'
         run: |
-          echo "🔍 Validating SQL syntax in migration files..."
+          echo "🔍 Validating SQL files..."
           for file in supabase/migrations/*.sql; do
             if [ -f "$file" ]; then
-              echo "Checking: $file"
-              # Basic SQL validation (check for common issues)
-              if ! grep -q ";" "$file"; then
-                echo "⚠️ Warning: $file might be missing semicolons"
+              echo "Checking: $(basename $file)"
+              
+              # Basic validation
+              if [ ! -s "$file" ]; then
+                echo "❌ ERROR: $file is empty!"
+                exit 1
               fi
-              if grep -i "drop table\|drop schema\|drop database" "$file"; then
-                echo "⚠️ Warning: $file contains DROP statements"
+              
+              # Warn about dangerous operations
+              if grep -iE "(drop|truncate)\s+(table|database|schema)" "$file"; then
+                echo "⚠️  WARNING: $file contains potentially dangerous operations"
+              fi
+              
+              # Check for common issues
+              if ! grep -q ";" "$file"; then
+                echo "⚠️  WARNING: $file might be missing semicolons"
               fi
             fi
           done
+          echo "✅ Validation complete"
 
   deploy-staging:
-    needs: [check-migrations, validate-migrations]
+    needs: validate
     if: |
-      github.ref == 'refs/heads/develop' && 
-      needs.check-migrations.outputs.has-migrations == 'true'
+      (github.ref == 'refs/heads/develop' || github.event.inputs.environment == 'staging') &&
+      needs.validate.outputs.has-migrations == 'true' &&
+      github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     environment: staging
     
@@ -76,27 +101,33 @@ jobs:
       - name: Deploy to Staging
         run: |
           echo "🚀 Deploying to Staging Environment"
-          echo "📊 Deploying ${{ needs.check-migrations.outputs.migration-count }} migrations"
+          echo "📊 Deploying ${{ needs.validate.outputs.migration-count }} migrations"
+          echo "🔗 Project: dijtowiohxvwdnvgprud"
           
-          # Link to staging
-          supabase link --project-ref ${{ secrets.STAGING_PROJECT_REF }} --password "${{ secrets.STAGING_DB_PASSWORD }}"
+          # Link to project (skip password prompt)
+          echo "" | supabase link --project-ref ${{ secrets.STAGING_PROJECT_REF }}
           
-          # Show what will be changed
-          echo "📋 Changes to be applied:"
-          supabase db diff || true
+          # Show what will change
+          echo ""
+          echo "📋 Database changes:"
+          supabase db diff || echo "Unable to generate diff"
           
-          # Push migrations
-          supabase db push
+          # Deploy using database URL (more reliable than password)
+          echo ""
+          echo "🚀 Applying migrations..."
+          supabase db push --db-url "${{ secrets.STAGING_DATABASE_URL }}"
           
+          echo ""
           echo "✅ Staging deployment complete!"
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
 
   deploy-production:
-    needs: [check-migrations, validate-migrations]
+    needs: validate
     if: |
-      github.ref == 'refs/heads/main' && 
-      needs.check-migrations.outputs.has-migrations == 'true'
+      (github.ref == 'refs/heads/main' || github.event.inputs.environment == 'production') &&
+      needs.validate.outputs.has-migrations == 'true' &&
+      github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     environment: production
     
@@ -107,62 +138,107 @@ jobs:
         with:
           version: latest
       
-      - name: Backup Production Schema
-        run: |
-          echo "📸 Creating backup of production schema..."
-          mkdir -p backups
-          
-          # Link to production
-          supabase link --project-ref ${{ secrets.PRODUCTION_PROJECT_REF }} --password "${{ secrets.PRODUCTION_DB_PASSWORD }}"
-          
-          # Pull current schema as backup
-          supabase db pull --schema public > backups/production-backup-$(date +%Y%m%d-%H%M%S).sql || true
-          
-          echo "✅ Backup created"
-        env:
-          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      - name: Create backup directory
+        run: mkdir -p backups
       
       - name: Deploy to Production
         run: |
           echo "🚀 Deploying to Production Environment"
-          echo "⚠️  Production deployment - Project: zutbqmhxvdgvcllobtxo"
-          echo "📊 Deploying ${{ needs.check-migrations.outputs.migration-count }} migrations"
+          echo "⚠️  PRODUCTION DEPLOYMENT"
+          echo "📊 Deploying ${{ needs.validate.outputs.migration-count }} migrations"
+          echo "🔗 Project: zutbqmhxvdgvcllobtxo"
           
-          # Show what will be changed
-          echo "📋 Changes to be applied:"
-          supabase db diff || true
+          # Link to project (skip password prompt)
+          echo "" | supabase link --project-ref ${{ secrets.PRODUCTION_PROJECT_REF }}
           
-          # Confirmation step (in real scenario, this would be manual approval)
-          echo "🚦 Proceeding with production deployment..."
+          # Try to create a backup (optional, don't fail if it doesn't work)
+          echo ""
+          echo "📸 Attempting to backup current schema..."
+          supabase db pull --db-url "${{ secrets.PRODUCTION_DATABASE_URL }}" > backups/pre-deploy-$(date +%Y%m%d-%H%M%S).sql || echo "Backup creation skipped"
           
-          # Push migrations
-          supabase db push
+          # Show what will change
+          echo ""
+          echo "📋 Database changes:"
+          supabase db diff || echo "Unable to generate diff"
           
+          # Deploy using database URL
+          echo ""
+          echo "🚀 Applying migrations..."
+          supabase db push --db-url "${{ secrets.PRODUCTION_DATABASE_URL }}"
+          
+          echo ""
           echo "✅ Production deployment complete!"
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
       
-      - name: Upload Backup
+      - name: Upload backup artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: production-backup
+          name: production-backup-${{ github.run_id }}
           path: backups/
           retention-days: 30
+          if-no-files-found: ignore
 
-  notify-no-migrations:
-    needs: check-migrations
-    if: needs.check-migrations.outputs.has-migrations == 'false'
+  migration-instructions:
+    needs: validate
+    if: needs.validate.outputs.has-migrations == 'false'
     runs-on: ubuntu-latest
     
     steps:
-      - name: Notify about missing migrations
+      - name: Provide instructions
         run: |
-          echo "❌ No migration files found in supabase/migrations/"
+          echo "❌ No migration files found!"
           echo ""
-          echo "To create migrations:"
-          echo "1. Pull from existing database: supabase db pull"
-          echo "2. Create new migration: supabase migration new <name>"
-          echo "3. Add SQL to the migration file"
-          echo "4. Commit and push"
+          echo "📚 To create migrations:"
+          echo ""
+          echo "1. Install Supabase CLI:"
+          echo "   brew install supabase/tap/supabase"
+          echo ""
+          echo "2. Get your access token:"
+          echo "   https://app.supabase.com/account/tokens"
+          echo ""
+          echo "3. Pull schema from staging:"
+          echo "   export SUPABASE_ACCESS_TOKEN=your-token"
+          echo "   supabase link --project-ref dijtowiohxvwdnvgprud"
+          echo "   supabase db pull --db-url 'your-staging-database-url'"
+          echo ""
+          echo "4. Commit and push:"
+          echo "   git add supabase/migrations/"
+          echo "   git commit -m 'Add database migrations'"
+          echo "   git push"
+          echo ""
+          echo "📖 See detailed instructions in:"
+          echo "   - QUICK_FIX.md"
+          echo "   - FIX_PASSWORD_ISSUE.md"
           exit 1
+
+  summary:
+    needs: [validate, deploy-staging, deploy-production]
+    if: always() && needs.validate.outputs.has-migrations == 'true'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Deployment summary
+        run: |
+          echo "📊 Deployment Summary"
+          echo "===================="
+          echo ""
+          echo "Migrations found: ${{ needs.validate.outputs.migration-count }}"
+          echo ""
+          
+          if [ "${{ needs.deploy-staging.result }}" == "success" ]; then
+            echo "✅ Staging: Deployed successfully"
+          elif [ "${{ needs.deploy-staging.result }}" == "skipped" ]; then
+            echo "⏭️  Staging: Skipped"
+          else
+            echo "❌ Staging: Failed or not run"
+          fi
+          
+          if [ "${{ needs.deploy-production.result }}" == "success" ]; then
+            echo "✅ Production: Deployed successfully"
+          elif [ "${{ needs.deploy-production.result }}" == "skipped" ]; then
+            echo "⏭️  Production: Skipped"
+          else
+            echo "❌ Production: Failed or not run"
+          fi

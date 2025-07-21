@@ -1,0 +1,169 @@
+name: Deploy to Supabase v2
+
+on:
+  push:
+    branches:
+      - develop
+      - main
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: 'Force deployment even without migrations'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  setup-check:
+    runs-on: ubuntu-latest
+    outputs:
+      has-migrations: ${{ steps.check.outputs.has-migrations }}
+      needs-initial-setup: ${{ steps.check.outputs.needs-initial-setup }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Check migration status
+        id: check
+        run: |
+          echo "🔍 Checking migration setup..."
+          
+          # Check if migrations directory exists
+          if [ ! -d "supabase/migrations" ]; then
+            echo "needs-initial-setup=true" >> $GITHUB_OUTPUT
+            echo "has-migrations=false" >> $GITHUB_OUTPUT
+            echo "❌ No migrations directory found"
+            exit 0
+          fi
+          
+          # Check for actual SQL files (ignore .gitkeep)
+          SQL_COUNT=$(find supabase/migrations -name "*.sql" -type f | wc -l)
+          
+          if [ $SQL_COUNT -gt 0 ]; then
+            echo "has-migrations=true" >> $GITHUB_OUTPUT
+            echo "needs-initial-setup=false" >> $GITHUB_OUTPUT
+            echo "✅ Found $SQL_COUNT migration files"
+            ls -la supabase/migrations/*.sql
+          else
+            echo "has-migrations=false" >> $GITHUB_OUTPUT
+            echo "needs-initial-setup=true" >> $GITHUB_OUTPUT
+            echo "⚠️ No SQL migration files found"
+          fi
+
+  initial-setup:
+    needs: setup-check
+    if: needs.setup-check.outputs.needs-initial-setup == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+      
+      - name: Pull schema from staging
+        run: |
+          echo "🚀 Performing initial migration setup..."
+          echo "📥 Pulling schema from staging (dijtowiohxvwdnvgprud)..."
+          
+          # Create migrations directory
+          mkdir -p supabase/migrations
+          
+          # Link to staging
+          supabase link --project-ref dijtowiohxvwdnvgprud --password "${{ secrets.STAGING_DB_PASSWORD }}"
+          
+          # Pull schema
+          supabase db pull
+          
+          # Check if migration was created
+          if [ "$(ls -A supabase/migrations/*.sql 2>/dev/null)" ]; then
+            echo "✅ Initial migration created successfully"
+            ls -la supabase/migrations/
+            
+            # Commit the migration
+            git config user.name "GitHub Actions"
+            git config user.email "actions@github.com"
+            git add supabase/migrations/
+            git commit -m "Add initial database migration from staging [automated]"
+            git push
+          else
+            echo "❌ Failed to create initial migration"
+            exit 1
+          fi
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+  deploy:
+    needs: [setup-check]
+    if: |
+      needs.setup-check.outputs.has-migrations == 'true' || 
+      github.event.inputs.force_deploy == 'true'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+      
+      - name: Deploy to Staging
+        if: github.ref == 'refs/heads/develop'
+        run: |
+          echo "🚀 Deploying to Staging Environment"
+          
+          supabase link --project-ref ${{ secrets.STAGING_PROJECT_REF }} --password "${{ secrets.STAGING_DB_PASSWORD }}"
+          
+          echo "📋 Database diff:"
+          supabase db diff || true
+          
+          supabase db push
+          
+          echo "✅ Staging deployment complete!"
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      
+      - name: Deploy to Production
+        if: github.ref == 'refs/heads/main'
+        run: |
+          echo "🚀 Deploying to Production Environment"
+          echo "⚠️  Production deployment - Project: zutbqmhxvdgvcllobtxo"
+          
+          supabase link --project-ref ${{ secrets.PRODUCTION_PROJECT_REF }} --password "${{ secrets.PRODUCTION_DB_PASSWORD }}"
+          
+          echo "📋 Database diff:"
+          supabase db diff || true
+          
+          supabase db push
+          
+          echo "✅ Production deployment complete!"
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+  manual-setup-instructions:
+    needs: setup-check
+    if: needs.setup-check.outputs.needs-initial-setup == 'true' && github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Instructions
+        run: |
+          echo "📚 Initial Setup Required"
+          echo "========================"
+          echo ""
+          echo "No migration files found. To fix this:"
+          echo ""
+          echo "1. Run locally:"
+          echo "   export SUPABASE_ACCESS_TOKEN=your-token"
+          echo "   ./scripts/initial-migration-setup.sh"
+          echo ""
+          echo "2. Or manually:"
+          echo "   supabase link --project-ref dijtowiohxvwdnvgprud"
+          echo "   supabase db pull"
+          echo ""
+          echo "3. Commit and push the migration files"
+          echo ""
+          echo "Get your token from: https://app.supabase.com/account/tokens"
